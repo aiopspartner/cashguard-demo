@@ -1,25 +1,20 @@
 import streamlit as st
-import psycopg2
+from supabase import create_client
 import pandas as pd
 from datetime import datetime
 
 # ── Page config ──────────────────────────────────
-st.set_page_config(page_title="CashGuard Leak Detector", page_icon="🔍", layout="wide")
+st.set_page_config(
+    page_title="CashGuard Leak Detector",
+    page_icon="🔍",
+    layout="wide"
+)
 
 # ── Secrets ───────────────────────────────────────
-SUPABASE_URL = st.secrets["SUPABASE_URL"]      # e.g. https://lscdsb.....supabase.co
-SUPABASE_KEY = st.secrets["SUPABASE_KEY"]      # sb_publish...
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
-# Supabase uses Postgres, anon key goes as password for user "postgres"
-conn_str = f"host={SUPABASE_URL.replace('https://','').replace('http://','')} " \
-           f"dbname=postgres user=postgres password={SUPABASE_KEY} " \
-           f"sslmode=require"
-
-@st.cache_resource
-def get_conn():
-    return psycopg2.connect(conn_str)
-
-conn = get_conn()
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ── Login (simple role switch) ────────────────────
 st.sidebar.title("🔐 CashGuard Login")
@@ -33,28 +28,30 @@ st.caption("Real-time leak detection • Powered by n8n + DeepSeek + Supabase")
 # ── KPI Cards ─────────────────────────────────────
 col1, col2, col3, col4 = st.columns(4)
 
-cur = conn.cursor()
-
-# Current Cash from cash_settings (if exists, else 0)
 try:
-    cur.execute("SELECT current_balance FROM cash_settings LIMIT 1")
-    row = cur.fetchone()
-    current_cash = row[0] if row else 0
+    # Total AR Outstanding
+    ar_resp = supabase.table("ar_invoices").select("amount,status").execute()
+    ar_data = ar_resp.data or []
+    total_ar = sum(r["amount"] for r in ar_data if r["status"] in ("outstanding", "overdue"))
 except:
-    current_cash = 0
+    total_ar = 0
 
-# Total AR Outstanding
-cur.execute("SELECT COALESCE(SUM(amount),0) FROM ar_invoices WHERE status IN ('outstanding','overdue')")
-total_ar = cur.fetchone()[0]
-
-# Total AP Pending
 try:
-    cur.execute("SELECT COALESCE(SUM(amount),0) FROM ap_payments WHERE status='pending'")
-    total_ap = cur.fetchone()[0]
+    # Total AP Pending
+    ap_resp = supabase.table("ap_payments").select("amount,status").execute()
+    ap_data = ap_resp.data or []
+    total_ap = sum(r["amount"] for r in ap_data if r["status"] == "pending")
 except:
     total_ap = 0
 
-# Net Position
+try:
+    # Current Cash
+    cs_resp = supabase.table("cash_settings").select("current_balance").limit(1).execute()
+    cs_data = cs_resp.data or []
+    current_cash = cs_data[0]["current_balance"] if cs_data else 0
+except:
+    current_cash = 0
+
 net = current_cash + total_ar - total_ap
 
 col1.metric("💰 Current Cash", f"HKD {current_cash:,.0f}")
@@ -68,37 +65,31 @@ st.divider()
 st.subheader("🚨 Leak Flags")
 
 try:
-    leaks_df = pd.read_sql("""
-        SELECT id, leak_type, client_name, description, 
-               amount_at_risk, severity, status, detected_at
-        FROM leaks
-        ORDER BY 
-            CASE severity 
-                WHEN 'critical' THEN 1 
-                WHEN 'high' THEN 2 
-                WHEN 'medium' THEN 3 
-                ELSE 4 END,
-            detected_at DESC
-    """, conn)
+    leaks_resp = supabase.table("leaks").select("*").order("detected_at", desc=True).execute()
+    leaks_data = leaks_resp.data or []
 
-    if len(leaks_df) == 0:
+    if len(leaks_data) == 0:
         st.success("✅ No leaks detected! Run n8n Leak Scanner to populate.")
     else:
-        # Color severity
-        def color_severity(val):
+        leaks_df = pd.DataFrame(leaks_data)
+
+        # Severity color map
+        def color_severity(row):
             colors = {
                 'critical': 'background-color: #fee2e2; color: #991b1b',
                 'high': 'background-color: #ffedd5; color: #9a3412',
                 'medium': 'background-color: #fef9c3; color: #854d0e',
                 'low': 'background-color: #f3f4f6; color: #374151'
             }
-            return colors.get(val, '')
+            return colors.get(row.get('severity', ''), '')
 
-        styled = leaks_df.style.map(color_severity, subset=['severity'])
+        # Show key columns
+        display_cols = ['leak_type', 'client_name', 'description', 'amount_at_risk', 'severity', 'status']
+        display_cols = [c for c in display_cols if c in leaks_df.columns]
+        styled = leaks_df[display_cols].style.apply(color_severity, axis=1)
         st.dataframe(styled, use_container_width=True, hide_index=True)
 except Exception as e:
     st.error(f"Error loading leaks: {e}")
-    leaks_df = pd.DataFrame()
 
 st.divider()
 
@@ -106,31 +97,25 @@ st.divider()
 st.subheader("📋 Action Queue (Pending Approval)")
 
 try:
-    actions_df = pd.read_sql("""
-        SELECT id, leak_id, client_name, action_type, note, status, created_at
-        FROM action_logs
-        WHERE status = 'pending_approval'
-        ORDER BY created_at DESC
-    """, conn)
+    actions_resp = supabase.table("action_logs").select("*").eq("status", "pending_approval").order("created_at", desc=True).execute()
+    actions_data = actions_resp.data or []
 
-    if len(actions_df) == 0:
+    if len(actions_data) == 0:
         st.info("No pending actions. n8n will populate this after leak scan.")
     else:
-        for _, row in actions_df.iterrows():
+        for row in actions_data:
             with st.container(border=True):
                 c1, c2, c3 = st.columns([3, 1, 1])
                 with c1:
-                    st.write(f"**{row['client_name']}** — {row['action_type']}")
-                    st.caption(row['note'])
+                    st.write(f"**{row.get('client_name', 'N/A')}** — {row.get('action_type', 'N/A')}")
+                    st.caption(row.get('note', ''))
                 with c2:
                     if st.button("✅ Approve", key=f"app_{row['id']}"):
-                        cur.execute("UPDATE action_logs SET status='approved' WHERE id=%s", (row['id'],))
-                        conn.commit()
+                        supabase.table("action_logs").update({"status": "approved"}).eq("id", row['id']).execute()
                         st.rerun()
                 with c3:
                     if st.button("😴 Snooze", key=f"snooze_{row['id']}"):
-                        cur.execute("UPDATE action_logs SET status='snoozed' WHERE id=%s", (row['id'],))
-                        conn.commit()
+                        supabase.table("action_logs").update({"status": "snoozed"}).eq("id", row['id']).execute()
                         st.rerun()
 except Exception as e:
     st.error(f"Error loading actions: {e}")
@@ -141,12 +126,11 @@ st.divider()
 if role == "finance":
     st.subheader("📄 Full AR Invoices (Finance View)")
     try:
-        ar_df = pd.read_sql("""
-            SELECT client_name, invoice_no, amount, currency, due_date, days_overdue, status
-            FROM ar_invoices
-            ORDER BY days_overdue DESC
-        """, conn)
-        st.dataframe(ar_df, use_container_width=True, hide_index=True)
+        ar_resp = supabase.table("ar_invoices").select("*").order("days_overdue", desc=True).execute()
+        ar_data = ar_resp.data or []
+        if ar_data:
+            ar_df = pd.DataFrame(ar_data)
+            st.dataframe(ar_df, use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error loading AR: {e}")
 
